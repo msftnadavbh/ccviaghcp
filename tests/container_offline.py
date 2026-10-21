@@ -17,8 +17,73 @@ import lab
 from test_kit import fixture_catalog
 
 
-def docker(*args):
-    return subprocess.check_output(['docker', *args], stderr=subprocess.STDOUT)
+def docker(*args, timeout=120):
+    return subprocess.check_output(['docker', *args], stderr=subprocess.STDOUT, timeout=timeout)
+
+
+def check_container(command, name):
+    created = False
+    checked = False
+    container = name
+    try:
+        identifier = docker(*command)
+        created = True
+        candidate = identifier.decode('ascii').strip()
+        if len(candidate) == 64 and all(c in '0123456789abcdef' for c in candidate):
+            container = candidate
+        for cycle in range(2):
+            if cycle:
+                docker('restart', container)
+            for attempt in range(45):
+                try:
+                    docker('exec', container, 'python', '-c', "import socket; socket.create_connection(('127.0.0.1',4000),timeout=2).close()")
+                    break
+                except subprocess.CalledProcessError:
+                    if json.loads(docker('inspect', container))[0]['State']['Status'] != 'running':
+                        raise AssertionError('Proxy exited before readiness') from None
+                    time.sleep(2)
+            else:
+                raise AssertionError('Proxy startup timed out')
+            result = docker('exec', container, 'python', '/etc/lab/native_assertions.py')
+            assert result.strip() == b'PASS synthetic native wire assertions'
+            logs = docker('logs', container, timeout=30)
+            for secret in (b'gho_' + b'x' * 36, b'sk-offline-only-sentinel'):
+                assert secret not in logs, 'Secret leaked in runtime log'
+            audit = [line for line in logs.splitlines() if line.startswith(b'{"class":')]
+            assert audit, 'Missing bounded classification audit'
+            for line in audit:
+                entry = json.loads(line)
+                assert len(line) <= 96 and set(entry) == {'class', 'initiator'}
+                assert entry['class'] in ('main', 'subagent', 'workflow', 'compaction', 'auxiliary')
+                assert entry['initiator'] in ('user', 'agent')
+            assert {json.loads(line)['initiator'] for line in audit} == {'user', 'agent'}
+            print('CHECK pinned non-root native TLS + synthetic wire/negative suite, start ' + str(cycle + 1))
+        checked = True
+    except BaseException as error:
+        # Retrieval and exclusive owner-only diagnostic creation must not mask the first error.
+        diagnostic = getattr(error, 'output', b'') or b''
+        if created:
+            try:
+                diagnostic += docker('logs', container, timeout=30)
+            except BaseException:
+                pass
+        try:
+            with tempfile.NamedTemporaryFile(prefix='ccviaghcp-offline-', suffix='-diagnostics.log', delete=False) as file:
+                file.write(diagnostic)
+                path = file.name
+            print('Synthetic diagnostics: ' + path, file=sys.stderr)
+        except BaseException:
+            print('WARNING synthetic diagnostics unavailable.', file=sys.stderr)
+        raise
+    finally:
+        if created:
+            try:
+                docker('rm', '-f', container, timeout=30)
+            except BaseException:
+                if checked:
+                    raise
+                print('WARNING offline container cleanup failed; primary failure preserved.', file=sys.stderr)
+    print('PASS pinned offline suite and container cleanup')
 
 
 def main():
@@ -54,43 +119,7 @@ def main():
         for source, target in mounts.items():
             command.extend(['--mount', f'type=bind,src={source},dst={target},readonly'])
         command.extend(['--entrypoint', 'python', common.IMAGE, '/etc/lab/start_gateway.py'])
-        try:
-            docker(*command)
-            for cycle in range(2):
-                if cycle:
-                    docker('restart', name)
-                for attempt in range(45):
-                    try:
-                        docker('exec', name, 'python', '-c', "import socket; socket.create_connection(('127.0.0.1',4000),timeout=2).close()")
-                        break
-                    except subprocess.CalledProcessError:
-                        if json.loads(docker('inspect', name))[0]['State']['Status'] != 'running':
-                            raise AssertionError('Proxy exited before readiness') from None
-                        time.sleep(2)
-                else:
-                    raise AssertionError('Proxy startup timed out')
-                result = docker('exec', name, 'python', '/etc/lab/native_assertions.py')
-                assert result.strip() == b'PASS synthetic native wire assertions'
-                logs = docker('logs', name)
-                for secret in (b'gho_' + b'x' * 36, b'sk-offline-only-sentinel'):
-                    assert secret not in logs, 'Secret leaked in runtime log'
-                audit = [line for line in logs.splitlines() if line.startswith(b'{"class":')]
-                assert audit, 'Missing bounded classification audit'
-                for line in audit:
-                    entry = json.loads(line)
-                    assert len(line) <= 96 and set(entry) == {'class', 'initiator'}
-                    assert entry['class'] in ('main', 'subagent', 'workflow', 'compaction', 'auxiliary')
-                    assert entry['initiator'] in ('user', 'agent')
-                assert {json.loads(line)['initiator'] for line in audit} == {'user', 'agent'}
-                print('PASS pinned non-root native TLS + synthetic wire/negative suite, start ' + str(cycle + 1))
-        except Exception as error:
-            # Only fake credentials, but keep diagnostics out of stdout/project.
-            path = Path(tempfile.gettempdir()) / (name + '-diagnostics.log')
-            path.write_bytes(docker('logs', name) + getattr(error, 'output', b''))
-            print('Synthetic diagnostics: ' + str(path), file=sys.stderr)
-            raise
-        finally:
-            docker('rm', '-f', name)  # Only the disposable OFFLINE container, never Azure.
+        check_container(command, name)
 
 
 if __name__ == '__main__':

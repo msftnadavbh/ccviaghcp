@@ -2,9 +2,11 @@
 import copy
 import base64
 import io
+import ipaddress
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import stat
 import subprocess
@@ -32,7 +34,7 @@ def fixture_catalog():
     return {'verified_at': '2099-01-01T00:00:00Z', 'endpoint': common.UPSTREAM,
             'response': {'data': [{'id': 'claude-sonnet-5.5', 'policy': {'state': 'enabled'}, 'supported_endpoints': ['/v1/messages'],
                 'capabilities': {'supports': {'streaming': True, 'tool_calls': True, 'adaptive_thinking': True},
-                                 'limits': {'max_prompt_tokens': 1000, 'max_output_tokens': 100}}}]}}
+                                 'limits': {'max_prompt_tokens': 200000, 'max_output_tokens': 8192}}}]}}
 
 
 class KitTests(unittest.TestCase):
@@ -99,8 +101,13 @@ class KitTests(unittest.TestCase):
                     self.assertEqual(args.count('--subscription'), 1)
                     self.assertEqual(args[args.index('--subscription') + 1], SUBSCRIPTION)
                     if index % 2 == 0:
-                        self.assertEqual(args, ['az', 'account', 'show', '--subscription', SUBSCRIPTION, '-o', 'json'])
-                self.assertEqual(call.call_args.kwargs['env']['AZURE_LOGGING_ENABLE_LOG_FILE'], 'false')
+                        self.assertEqual(args, ['az', 'account', 'show', '--subscription', SUBSCRIPTION, '--only-show-errors', '-o', 'json'])
+                    self.assertEqual(invocation.kwargs['stderr'], subprocess.PIPE)
+                for invocation in call.call_args_list[-2:]:
+                    self.assertEqual(invocation.kwargs['env']['AZURE_LOGGING_ENABLE_LOG_FILE'], 'false')
+                    self.assertEqual(invocation.kwargs['env']['AZURE_CORE_COLLECT_TELEMETRY'], 'false')
+                for invocation in call.call_args_list[:-2]:
+                    self.assertIsNone(invocation.kwargs['env'])
             with patch('common.subprocess.check_output', side_effect=[json.dumps(good).encode(), b'{}', b'{}']) as call:
                 common.az('vm', 'list')
                 with self.assertRaises(ValueError):
@@ -278,6 +285,22 @@ class KitTests(unittest.TestCase):
                     lab.prepare(types.SimpleNamespace(operator_object_id=None, operator_ip='8.8.8.8'))
             self.assertEqual((lab.LOCAL / 'ca.crt').read_bytes(), existing_ca)
 
+    def test_interrupted_tls_preparation_remains_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory, patch('lab.LOCAL', Path(directory)):
+            args = types.SimpleNamespace(operator_object_id='00000000-0000-0000-0000-000000000001', operator_ip='8.8.8.8')
+            def interrupted(*args):
+                common.write_private(lab.LOCAL / 'ca.key', 'synthetic-interrupted-TLS-key')
+                raise subprocess.CalledProcessError(1, ['openssl'])
+            with patch('lab.openssl', side_effect=interrupted):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    lab.prepare(args)
+            before = {p.name: p.read_bytes() for p in lab.LOCAL.iterdir()}
+            with patch('lab.openssl') as openssl:
+                with self.assertRaisesRegex(common.SafeError, 'Incomplete existing TLS material'):
+                    lab.prepare(args)
+                openssl.assert_not_called()
+            self.assertEqual({p.name: p.read_bytes() for p in lab.LOCAL.iterdir()}, before)
+
     def test_live_model_config_no_fallback(self):
         catalog = fixture_catalog()
         selection = dict.fromkeys(('sonnet', 'opus', 'haiku'), 'claude-sonnet-5.5')
@@ -307,6 +330,107 @@ class KitTests(unittest.TestCase):
                 selected['sonnet'] = 'claude-not-discovered'
             with self.assertRaises((ValueError, KeyError)):
                 common.model_config(changed, selected)
+
+    def test_model_caps_independent_exact_integer_contract(self):
+        selection = dict.fromkeys(('sonnet', 'opus', 'haiku'), 'claude-sonnet-5.5')
+        for field, cap in (('max_prompt_tokens', common.WINDOW), ('max_output_tokens', common.OUTPUT)):
+            for value in (cap - 1, cap, cap + 1, True, False, None, 'sentinel-limit', str(cap), float(cap), 'missing'):
+                with self.subTest(field=field, value=value):
+                    catalog = fixture_catalog()
+                    limits = catalog['response']['data'][0]['capabilities']['limits']
+                    if value == 'missing':
+                        del limits[field]
+                    else:
+                        limits[field] = value
+                    if type(value) is int and value >= cap:
+                        for model in common.model_config(catalog, selection)['model_list']:
+                            self.assertEqual(model['litellm_params']['max_tokens'], common.OUTPUT)
+                            self.assertEqual(model['model_info']['max_input_tokens'], common.WINDOW)
+                            self.assertEqual(model['model_info']['max_tokens'], common.WINDOW)
+                            self.assertEqual(model['model_info']['max_output_tokens'], common.OUTPUT)
+                    else:
+                        with self.assertRaisesRegex(common.SafeError, field) as caught:
+                            common.model_config(catalog, selection)
+                        self.assertNotIn('sentinel-limit', str(caught.exception))
+        for limits in (None, [], 'sentinel-limit'):
+            catalog = fixture_catalog()
+            catalog['response']['data'][0]['capabilities']['limits'] = limits
+            with self.assertRaises(common.SafeError):
+                common.model_config(catalog, selection)
+        catalog = fixture_catalog()
+        entry = catalog['response']['data'][0]
+        bad = copy.deepcopy(entry)
+        bad['id'] = 'claude-haiku-synthetic'
+        bad['capabilities']['limits']['max_prompt_tokens'] = common.WINDOW - 1
+        catalog['response']['data'].append(bad)
+        with self.assertRaises(common.SafeError):
+            common.model_config(catalog, selection | {'haiku': bad['id']})
+
+    def test_render_changed_config_refuses_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory, patch('lab.LOCAL', Path(directory)), \
+                patch('sys.stdout', new_callable=io.StringIO):
+            catalog = fixture_catalog()
+            common.write_private(lab.LOCAL / 'catalog.json', json.dumps(catalog))
+            common.write_private(lab.LOCAL / 'selection.json', json.dumps(dict.fromkeys(('sonnet', 'opus', 'haiku'), 'claude-sonnet-5.5')))
+            lab.render()
+            before = (lab.LOCAL / 'config.json').read_bytes()
+            catalog['response']['data'][0]['capabilities']['limits']['max_output_tokens'] = common.OUTPUT - 1
+            (lab.LOCAL / 'catalog.json').write_text(json.dumps(catalog))
+            with self.assertRaisesRegex(common.SafeError, 'max_output_tokens'):
+                lab.render()
+            self.assertEqual((lab.LOCAL / 'config.json').read_bytes(), before)
+            catalog['response']['data'][0]['capabilities']['limits']['max_output_tokens'] = common.OUTPUT
+            (lab.LOCAL / 'catalog.json').write_text(json.dumps(catalog))
+            (lab.LOCAL / 'config.json').write_text('{}')
+            with self.assertRaisesRegex(common.SafeError, 'Derived config changed'):
+                lab.render()
+            self.assertEqual((lab.LOCAL / 'config.json').read_text(), '{}')
+
+    def test_cli_boundaries_only_expose_authored_safe_errors_or_class(self):
+        errors = [common.SafeError('Fixed public validation message'), ValueError('sentinel-value'),
+                  ipaddress.AddressValueError('sentinel-ip'),
+                  json.JSONDecodeError('sentinel-json', 'sentinel-document', 0),
+                  AssertionError('sentinel-assert'), KeyboardInterrupt('sentinel-interrupt'),
+                  subprocess.CalledProcessError(1, ['sentinel-command'], output=b'sentinel-stdout', stderr=b'sentinel-stderr')]
+        for script, args in (('lab', types.SimpleNamespace(command='render')),
+                             ('copilot_auth', types.SimpleNamespace(action='finish')),
+                             ('start_gateway', None),
+                             ('smoke', types.SimpleNamespace(private=False, count_tokens=False))):
+            for error in errors:
+                with self.subTest(script=script, exception=type(error).__name__), tempfile.TemporaryDirectory() as directory, \
+                        patch('common.LOCAL', Path(directory)), patch('common.protect_dir'), \
+                        patch('common.read_private', side_effect=error), \
+                        patch('pathlib.Path.read_text', side_effect=error), \
+                        patch('ssl.create_default_context'), \
+                        patch('argparse.ArgumentParser.parse_args', return_value=args), \
+                        patch('sys.stdout', new_callable=io.StringIO) as out, \
+                        patch('sys.stderr', new_callable=io.StringIO) as err:
+                    with self.assertRaises(SystemExit) as caught:
+                        runpy.run_path(str(common.ROOT / 'scripts' / (script + '.py')), run_name='__main__')
+                    self.assertEqual(caught.exception.code, 1)
+                    output = out.getvalue() + err.getvalue()
+                    self.assertNotIn('sentinel-', output)
+                    self.assertIn(str(error) if isinstance(error, common.SafeError) else type(error).__name__, output)
+        with patch('lab.write_private') as write:
+            for ip, oid, message in (('sentinel-ip', '00000000-0000-0000-0000-000000000001', 'operator-ip'),
+                                     ('8.8.8.8', 'sentinel-uuid', 'operator-object-id')):
+                with self.assertRaisesRegex(common.SafeError, message) as caught:
+                    lab.prepare(types.SimpleNamespace(operator_object_id=oid, operator_ip=ip))
+                self.assertNotIn('sentinel-', str(caught.exception))
+                self.assertTrue(caught.exception.__suppress_context__)
+            write.assert_not_called()
+
+    @patch.dict(os.environ, TARGET_ENV)
+    def test_az_warning_stderr_does_not_contaminate_json(self):
+        account = {'id': SUBSCRIPTION, 'tenantId': TENANT, 'state': 'Enabled'}
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / 'az'
+            executable.write_text('#!/bin/sh\nprintf "sentinel-warning\\n" >&2\nprintf \'%s\' \'' + json.dumps(account) + '\'\n')
+            executable.chmod(0o700)
+            with patch.dict(os.environ, {'PATH': directory}), patch('sys.stdout', new_callable=io.StringIO) as out, \
+                    patch('sys.stderr', new_callable=io.StringIO) as err:
+                self.assertEqual(json.loads(common.az('aks', 'show')), account)
+                self.assertEqual(out.getvalue() + err.getvalue(), '')
 
     def test_auth_poll_pending_slowdown_expiry_denial(self):
         clock = [0]
@@ -404,6 +528,40 @@ class KitTests(unittest.TestCase):
                             b'data: {"type":"message_stop"}\n'])
         self.assertEqual([e['type'] for e in events], ['message_start', 'message_stop'])
 
+    def test_smoke_fixed_stage_failures(self):
+        plain = {'type': 'message', 'role': 'assistant', 'content': [{'type': 'text', 'text': 'OK'}]}
+        tool = {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'name': 'get_probe_value',
+                'id': 'synthetic-tool', 'input': {'id': 'probe'}}]}
+        final = {'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'synthetic-nonce'}]}
+        events = b''.join(b'data: ' + json.dumps({'type': kind}).encode() + b'\n\n'
+                          for kind in ('message_start', 'content_block_delta', 'message_stop'))
+        for index, status, body, content_type, message in (
+                (0, 200, {}, '', 'Authentication rejection mismatch'),
+                (2, 502, {}, '', 'Native Messages JSON check failed'),
+                (3, 502, {}, '', 'Native Messages SSE check failed'),
+                (3, 200, {}, 'application/json', 'Native SSE content type mismatch'),
+                (4, 200, {'stop_reason': 'end_turn'}, '', 'Native tool_use check failed'),
+                (4, 200, {'stop_reason': 'tool_use', 'content': []}, '', 'Native tool_use probe mismatch'),
+                (5, 200, {'stop_reason': 'end_turn', 'content': []}, '', 'Native tool_result round trip failed'),
+                (6, 200, {'input_tokens': True}, '', 'Optional local count_tokens estimate check failed')):
+            replies = [(401, {}, ''), (401, {}, ''), (200, plain, ''),
+                       (200, events, 'text/event-stream'), (200, tool, ''), (200, final, ''), (200, {'input_tokens': 1}, '')]
+            replies[index] = status, body, content_type
+            responses = []
+            for status, body, content_type in replies:
+                response = io.BytesIO(body if isinstance(body, bytes) else json.dumps(body).encode())
+                response.status = status
+                response.getheader = lambda name, default='', value=content_type: value
+                responses.append(response)
+            with self.subTest(stage=message), patch('smoke.ssl.create_default_context'), \
+                    patch('smoke.read_private', return_value='synthetic-key'), \
+                    patch('smoke.secrets.token_hex', return_value='synthetic-nonce'), \
+                    patch('smoke.LabHTTPS') as connection, patch('sys.stdout', new_callable=io.StringIO):
+                connection.return_value.getresponse.side_effect = responses
+                with self.assertRaises(common.SafeError) as caught:
+                    smoke.run('127.0.0.1', 4000, count_tokens=True)
+                self.assertEqual(str(caught.exception), message)
+
     def test_deployment_gates_before_azure(self):
         with tempfile.TemporaryDirectory() as directory, patch('lab.LOCAL', Path(directory)), patch('lab.az') as az:
             gates = ('local-smoke', 'review', 'claude')
@@ -436,6 +594,288 @@ class KitTests(unittest.TestCase):
                     self.assertNotIn('--mode', call.args)
                     self.assertNotIn('--no-pretty-print', call.args)
                     self.assertNotIn('--result-format', call.args)
+
+    def test_retry_stderr_exhaustion_and_nonretry_failures(self):
+        with tempfile.TemporaryDirectory() as directory, patch('lab.LOCAL', Path(directory)):
+            for gate in ('local-smoke', 'review', 'claude'):
+                common.write_private(lab.LOCAL / ('gate-' + gate + '.txt'), 'synthetic')
+            for code, attempts in ((b'AuthorizationFailed', 3), (b'LinkedAuthorizationFailed', 3),
+                                   (b'PrincipalNotFound', 3), (b'sentinel-nonretry', 1)):
+                error = subprocess.CalledProcessError(1, ['sentinel-command'], output=b'sentinel-stdout', stderr=code)
+                with patch('lab.parameters', return_value=lab.LOCAL / 'parameters-aks.json'), \
+                        patch('lab.az', side_effect=error) as cli, patch('lab.time.sleep') as sleep:
+                    with self.assertRaises(subprocess.CalledProcessError) as caught:
+                        lab.deploy(types.SimpleNamespace(action='create', phase='aks'))
+                    self.assertIs(caught.exception, error)
+                    self.assertEqual(cli.call_count, attempts)
+                    self.assertEqual(sleep.call_count, attempts - 1)
+
+    def test_local_container_loopback_and_security_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory, patch('lab.LOCAL', Path(directory)), patch('lab.render'), \
+                patch('lab.os.getuid', return_value=1000), patch('lab.os.getgid', return_value=1000), \
+                patch('lab.subprocess.run') as run:
+            common.write_private(lab.LOCAL / 'access-token', 'gho_' + 'x' * 36)
+            common.write_private(lab.LOCAL / 'gateway-key', 'sk-synthetic-local')
+            lab.local()
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index('-p') + 1], '127.0.0.1:4000:4000')
+            for value in ('--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges', '1000:1000', common.IMAGE):
+                self.assertIn(value, command)
+            self.assertNotIn('sk-synthetic-local', ' '.join(command))
+            self.assertEqual(run.call_args.kwargs['env']['LITELLM_MASTER_KEY'], 'sk-synthetic-local')
+            for index, value in enumerate(command):
+                if value == '--mount':
+                    self.assertTrue(command[index + 1].endswith(',readonly'))
+
+    def test_offline_harness_preserves_first_error_and_requires_cleanup(self):
+        import container_offline
+        identifier = 'a' * 64
+        audit = b'{"class":"main","initiator":"user"}\n{"class":"main","initiator":"agent"}\n'
+        for scenario in ('missing-image', 'unavailable-logs', 'diagnostic-write', 'primary-cleanup', 'success-cleanup', 'success'):
+            primary = subprocess.CalledProcessError(125, ['docker'], output=b'synthetic-primary')
+            cleanup = subprocess.CalledProcessError(1, ['docker'], output=b'synthetic-cleanup')
+            def docker(*args, timeout=120):
+                if args[0] == 'run':
+                    if scenario == 'missing-image':
+                        raise primary
+                    return identifier.encode() + b'\n'
+                self.assertEqual(args[1] if args[0] != 'rm' else args[2], identifier)
+                if args[0] == 'rm':
+                    self.assertLessEqual(timeout, 30)
+                    if scenario in ('primary-cleanup', 'success-cleanup'):
+                        raise cleanup
+                elif args[0] == 'logs':
+                    self.assertLessEqual(timeout, 30)
+                    if scenario == 'unavailable-logs':
+                        raise RuntimeError('synthetic-log-failure')
+                    return audit
+                elif args[0] == 'exec' and args[-1] == '/etc/lab/native_assertions.py':
+                    if scenario not in ('success-cleanup', 'success'):
+                        raise primary
+                    return b'PASS synthetic native wire assertions'
+                return b''
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory, \
+                    patch('container_offline.docker', side_effect=docker) as cli, \
+                    patch('container_offline.tempfile.tempdir', directory), \
+                    patch('sys.stderr', new_callable=io.StringIO) as err, \
+                    patch('sys.stdout', new_callable=io.StringIO) as out:
+                writer = tempfile.NamedTemporaryFile
+                def diagnostic(*args, **kwargs):
+                    file = writer(*args, **kwargs)
+                    if scenario == 'diagnostic-write':
+                        def fail_write(data):
+                            raise OSError('synthetic-diagnostic-failure')
+                        file.write = fail_write
+                    return file
+                with patch('container_offline.tempfile.NamedTemporaryFile', side_effect=diagnostic):
+                    if scenario == 'success':
+                        container_offline.check_container(['run'], 'synthetic-name')
+                        self.assertIn('PASS pinned offline suite and container cleanup', out.getvalue())
+                    else:
+                        with self.assertRaises(subprocess.CalledProcessError) as caught:
+                            container_offline.check_container(['run'], 'synthetic-name')
+                        self.assertIs(caught.exception, cleanup if scenario == 'success-cleanup' else primary)
+                        self.assertNotIn('PASS pinned offline suite', out.getvalue())
+                if scenario == 'missing-image':
+                    self.assertEqual(cli.call_count, 1)
+                else:
+                    self.assertEqual(cli.call_args.args, ('rm', '-f', identifier))
+                if scenario == 'primary-cleanup':
+                    self.assertIn('primary failure preserved', err.getvalue())
+                for file in Path(directory).iterdir():
+                    self.assertEqual(stat.S_IMODE(file.stat().st_mode), 0o600)
+
+    @patch.dict(os.environ, TARGET_ENV)
+    def test_published_operator_ip_block_offline(self):
+        document = (common.ROOT / 'docs/setup.md').read_text()
+        block = document.split('<!-- operator-ip-update: tested verbatim offline -->', 1)[1]
+        code = block.split("python3 - <<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+        compiled = compile(code, '<published-operator-ip-block>', 'exec')
+        base = '/subscriptions/' + SUBSCRIPTION + '/resourceGroups/' + common.RG + '/providers/'
+        cluster_id = base + 'Microsoft.ContainerService/managedClusters/ccviaghcp-aks'
+        nat_id = base + 'Microsoft.Network/natGateways/ccviaghcp-nat'
+        pip_id = base + 'Microsoft.Network/publicIPAddresses/ccviaghcp-nat-pip'
+        subnet_id = base + 'Microsoft.Network/virtualNetworks/ccviaghcp-vnet/subnets/aks'
+        identity_id = base + 'Microsoft.ManagedIdentity/userAssignedIdentities/ccviaghcp-aks-control'
+        old, new, nat_cidr = '8.8.8.8/32', '8.8.4.4/32', '9.9.9.9/32'
+        cluster = {'id': cluster_id, 'provisioningState': 'Succeeded', 'location': common.REGION,
+            'enableRbac': True, 'disableLocalAccounts': True,
+            'aadProfile': {'tenantId': TENANT, 'managed': True, 'enableAzureRbac': True},
+            'identity': {'type': 'UserAssigned', 'userAssignedIdentities': {identity_id: {'principalId': 'synthetic-principal'}}},
+            'nodeResourceGroup': 'ccviaghcp-aks-nodes-rg', 'agentPoolProfiles': [{'vnetSubnetId': subnet_id}],
+            'apiServerAccessProfile': {'authorizedIpRanges': [old, nat_cidr], 'enablePrivateCluster': False},
+            'networkProfile': {'outboundType': 'userAssignedNATGateway', 'networkPlugin': 'azure',
+                'networkPluginMode': 'overlay', 'networkDataplane': 'cilium', 'networkPolicy': 'cilium',
+                'loadBalancerSku': 'standard', 'podCidr': '10.78.0.0/16', 'serviceCidr': '10.79.0.0/16', 'dnsServiceIp': '10.79.0.10'}}
+        nat = {'id': nat_id, 'provisioningState': 'Succeeded', 'location': common.REGION,
+            'sku': {'name': 'Standard'}, 'publicIpAddresses': [{'id': pip_id}]}
+        pip = {'id': pip_id, 'provisioningState': 'Succeeded', 'location': common.REGION, 'sku': {'name': 'Standard'},
+            'publicIPAllocationMethod': 'Static', 'publicIPAddressVersion': 'IPv4', 'ipAddress': nat_cidr[:-3]}
+        subnet = {'id': subnet_id, 'provisioningState': 'Succeeded', 'addressPrefix': '10.77.0.0/24', 'natGateway': {'id': nat_id}}
+        scenarios = ('success', 'nullable-public-profile', 'network-enum-case', 'private-profile',
+            'new-equals-nat', 'wrong-target', 'unbound', 'bad-ip', 'private-ip', 'ipv6', 'missing-nat',
+            'unexpected-ranges', 'pending', 'tenant-drift', 'security-drift', 'subnet-drift', 'nat-id-drift',
+            'parameter-drift', 'password-drift', 'failed-update', 'interrupted-update', 'pending-readback',
+            'wrong-readback', 'already-updated', 'partial-local', 'replace-failure', 'inputs-changed')
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory, \
+                    patch('lab.LOCAL', Path(directory)), \
+                    patch.dict(os.environ, {'NEW_OPERATOR_IPV4': new[:-3]}), \
+                    patch('sys.stdout', new_callable=io.StringIO) as out, \
+                    patch('sys.stderr', new_callable=io.StringIO) as err:
+                inputs = BINDING | {'operatorObjectId': '00000000-0000-0000-0000-000000000001', 'operatorCidr': old}
+                common.write_private(lab.LOCAL / 'deployment-inputs.json', json.dumps(inputs))
+                preserved = {'admin-password': 'synthetic-unchanged-password', 'gateway-key': 'synthetic-key',
+                             'tls.key': 'synthetic-TLS-bytes', 'ca.key': 'synthetic-CA-bytes',
+                             'selection.json': '{}', 'gate-review.txt': 'synthetic-evidence'}
+                for name, value in preserved.items():
+                    common.write_private(lab.LOCAL / name, value)
+                for phase in ('foundation', 'aks'):
+                    lab.parameters(phase)
+                current, actual_nat = copy.deepcopy(cluster), copy.deepcopy(nat)
+                if scenario == 'wrong-target':
+                    os.environ['CCVIAGHCP_SUBSCRIPTION_ID'] = TENANT
+                elif scenario == 'unbound':
+                    (lab.LOCAL / 'deployment-inputs.json').write_text(json.dumps({k: v for k, v in inputs.items() if k not in BINDING}))
+                elif scenario in ('bad-ip', 'private-ip', 'ipv6'):
+                    os.environ['NEW_OPERATOR_IPV4'] = {'bad-ip': 'sentinel-IP\n', 'private-ip': '10.0.0.1', 'ipv6': '2001:4860:4860::8888'}[scenario]
+                elif scenario == 'new-equals-nat':
+                    os.environ['NEW_OPERATOR_IPV4'] = nat_cidr[:-3]
+                elif scenario == 'nullable-public-profile':
+                    current['apiServerAccessProfile']['enablePrivateCluster'] = None
+                elif scenario == 'private-profile':
+                    current['apiServerAccessProfile']['enablePrivateCluster'] = True
+                elif scenario == 'network-enum-case':
+                    current['networkProfile'] = {k: v.upper() for k, v in current['networkProfile'].items()}
+                elif scenario == 'unexpected-ranges':
+                    current['apiServerAccessProfile']['authorizedIpRanges'].append('0.0.0.0/0')
+                elif scenario == 'pending':
+                    current['provisioningState'] = 'Updating'
+                elif scenario == 'tenant-drift':
+                    current['aadProfile']['tenantId'] = SUBSCRIPTION
+                elif scenario == 'security-drift':
+                    current['disableLocalAccounts'] = False
+                elif scenario == 'subnet-drift':
+                    current['agentPoolProfiles'][0]['vnetSubnetId'] = 'synthetic-wrong-subnet'
+                elif scenario == 'nat-id-drift':
+                    actual_nat['id'] = 'synthetic-wrong-nat'
+                elif scenario in ('parameter-drift', 'password-drift'):
+                    path = lab.LOCAL / 'parameters-aks.json'
+                    values = json.loads(path.read_text())
+                    values['parameters']['adminPassword' if scenario == 'password-drift' else 'operatorObjectId']['value'] = 'synthetic-drift'
+                    path.write_text(json.dumps(values))
+                elif scenario == 'already-updated':
+                    current['apiServerAccessProfile']['authorizedIpRanges'] = [new, nat_cidr]
+                before = {p.name: p.read_bytes() for p in lab.LOCAL.iterdir()}
+                updates = []
+                def azure(*args, timeout=None):
+                    self.assertEqual(timeout, 900)
+                    self.assertEqual(args[args.index('--resource-group') + 1], common.RG)
+                    if args[:2] == ('aks', 'update'):
+                        self.assertEqual(args, ('aks', 'update', '--resource-group', common.RG, '--name', 'ccviaghcp-aks',
+                            '--api-server-authorized-ip-ranges', ','.join(sorted([new, nat_cidr]))))
+                        updates.append(args)
+                        if scenario == 'failed-update':
+                            raise subprocess.CalledProcessError(1, ['sentinel-command'], stderr=b'sentinel-body')
+                        if scenario == 'interrupted-update':
+                            raise KeyboardInterrupt('sentinel-interrupted')
+                        if scenario != 'wrong-readback':
+                            current['apiServerAccessProfile']['authorizedIpRanges'] = [new, nat_cidr]
+                        if scenario == 'pending-readback':
+                            current['provisioningState'] = 'Updating'
+                        if scenario == 'inputs-changed':
+                            (lab.LOCAL / 'deployment-inputs.json').write_text(json.dumps(inputs) + '\n')
+                        return b'{}'
+                    if args[:2] == ('aks', 'show'):
+                        value = current
+                    elif args[:4] == ('network', 'nat', 'gateway', 'show'):
+                        if scenario == 'missing-nat':
+                            raise subprocess.CalledProcessError(1, ['az'])
+                        value = actual_nat
+                    elif args[:3] == ('network', 'public-ip', 'show'):
+                        value = pip
+                    elif args[:4] == ('network', 'vnet', 'subnet', 'show'):
+                        value = subnet
+                    else:
+                        self.fail('Unexpected Azure operation')
+                    return json.dumps(value).encode()
+                original_parameters = lab.parameters
+                def parameters(phase):
+                    if scenario == 'partial-local' and phase == 'aks':
+                        raise OSError('sentinel-local-failure')
+                    return original_parameters(phase)
+                replace = os.replace
+                def replace_inputs(*args):
+                    if scenario == 'replace-failure':
+                        raise OSError('sentinel-replace-failure')
+                    return replace(*args)
+                with patch('common.az', side_effect=azure) as cli, patch('lab.parameters', side_effect=parameters), \
+                        patch('os.replace', side_effect=replace_inputs):
+                    if scenario in ('success', 'already-updated', 'nullable-public-profile', 'network-enum-case'):
+                        exec(compiled, {})
+                        self.assertIn('PASS ARM ranges', out.getvalue())
+                    else:
+                        with self.assertRaises(SystemExit) as caught:
+                            exec(compiled, {})
+                        self.assertEqual(caught.exception.code, 1)
+                        self.assertNotIn('PASS', out.getvalue())
+                    if scenario in ('wrong-target', 'unbound', 'bad-ip', 'private-ip', 'ipv6', 'parameter-drift', 'password-drift'):
+                        cli.assert_not_called()
+                if scenario in ('success', 'already-updated', 'partial-local', 'nullable-public-profile', 'network-enum-case'):
+                    self.assertEqual(json.loads((lab.LOCAL / 'deployment-inputs.json').read_text()), inputs | {'operatorCidr': new})
+                elif scenario != 'inputs-changed':
+                    self.assertEqual({p.name: p.read_bytes() for p in lab.LOCAL.iterdir()}, before)
+                if scenario in ('partial-local', 'replace-failure', 'inputs-changed'):
+                    self.assertIn('ARM updated; local reconciliation incomplete', err.getvalue())
+                if scenario in ('failed-update', 'interrupted-update', 'pending-readback', 'wrong-readback'):
+                    self.assertIn('inspect provisioning state before retry', err.getvalue())
+                if scenario == 'already-updated':
+                    self.assertEqual(updates, [])
+                if scenario in ('new-equals-nat', 'private-profile'):
+                    self.assertEqual(updates, [])
+                if scenario == 'new-equals-nat':
+                    self.assertIn('must differ from the NAT address', err.getvalue())
+                self.assertNotIn('sentinel-', out.getvalue() + err.getvalue())
+                self.assertNotIn(preserved['admin-password'], out.getvalue() + err.getvalue())
+                for name, value in preserved.items():
+                    self.assertEqual((lab.LOCAL / name).read_text(), value)
+                for path in lab.LOCAL.iterdir():
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                if scenario == 'partial-local':
+                    # Rerun the same published block, with ARM already changed and partial local files.
+                    updates.clear()
+                    with patch('common.az', side_effect=azure):
+                        exec(compiled, {})
+                    self.assertEqual(updates, [])
+                    for phase in ('foundation', 'aks'):
+                        self.assertEqual(json.loads((lab.LOCAL / ('parameters-' + phase + '.json')).read_text())['parameters']['operatorCidr']['value'], new)
+
+    def test_operator_ip_shell_preserves_python_exit(self):
+        document = (common.ROOT / 'docs/setup.md').read_text()
+        block = document.split('<!-- operator-ip-update: tested verbatim offline -->', 1)[1]
+        shell = block.split('```bash\n', 1)[1].split('\n```', 1)[0]
+        bash = shutil.which('bash')
+        self.assertIsNotNone(bash)
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / 'python3'
+            for code in (0, 7):
+                executable.write_text('#!/bin/sh\n'
+                    'test "$NEW_OPERATOR_IPV4" = "8.8.4.4" || exit 99\n'
+                    '/bin/cat >/dev/null\n' + 'exit ' + str(code) + '\n')
+                executable.chmod(0o700)
+                result = subprocess.run([bash, '--noprofile', '--norc', '-c', shell],
+                    input='8.8.4.4\n', env={'PATH': directory}, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, code)
+
+    def test_windows_new_window_instructions_precede_bootstrap(self):
+        document = (common.ROOT / 'windows/README.md').read_text()
+        block = document.split('### Each new PowerShell window', 1)[1].split('## 3.', 1)[0]
+        self.assertIn('$launch = ', block)
+        self.assertIn('-Scope MachinePolicy', block)
+        self.assertIn('-Scope UserPolicy', block)
+        self.assertIn('} else {\n    Set-ExecutionPolicy -Scope Process RemoteSigned -Force', block)
+        bootstrap = document.split('## 3.', 1)[1].split('## 4.', 1)[0]
+        self.assertLess(bootstrap.index('Set-Location'), bootstrap.index('.\\bootstrap.ps1'))
 
     def test_manual_windows_acceptance_does_not_block_backend_deployment(self):
         with tempfile.TemporaryDirectory() as directory, patch('lab.LOCAL', Path(directory)):

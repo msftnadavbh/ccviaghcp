@@ -53,7 +53,9 @@ IDs or discovery results as example data.
 Three credentials have distinct jobs:
 
 1. VM administrator password: protected local input and secure ARM parameter.
-2. Gateway key: client-to-gateway authentication, never upstream Copilot auth.
+2. Gateway key: LiteLLM **MASTER/ADMIN credential for one trusted user**, used for
+   client-to-gateway authentication, never upstream Copilot auth. It is not a
+   least-privilege inference key; never distribute it to untrusted clients.
 3. Designated Copilot OAuth grant: server-side only, never given to Windows.
 
 The CA private key never enters Kubernetes or the Windows handoff. Only the server
@@ -79,8 +81,11 @@ Messages passthrough in this pinned image; it does **not** translate requests in
 OpenAI chat/Responses. The `github_copilot/` exchange path is not used. Discovery
 must substantiate enabled policy, native Messages, streaming/tools/adaptive
 capabilities, and limits. There is no wildcard, guessed entitlement, stale-catalog
-fallback, or implicit newest-model alias. Config caps are at most 200,000 input
-and 8,192 output tokens, bounded further by the live catalog.
+fallback, or implicit newest-model alias. Every selection must advertise exact
+integer limits at least 200,000 input and 8,192 output; config and Windows use
+those fixed caps. Smaller live limits are rejected, not silently adapted. Review
+insufficient existing selections/config explicitly. This does not implement
+server-side input token counting; the actual output policy remains 8,192.
 
 The existing LiteLLM policy hook rejects non-Messages inference, unlisted models,
 body credentials/headers/transport overrides, and passthrough headers. It rebuilds
@@ -88,8 +93,15 @@ upstream headers and separates gateway authentication from the designated OAuth
 bearer. The exact upstream host is `https://api.enterprise.githubcopilot.com`;
 discovery and both streaming/nonstreaming upstream clients refuse redirects.
 Native JSON, SSE, tools, adaptive thinking, and supported beta data remain intact.
-Unverified cache TTL opt-in is not enabled; optional token counting is not exact
-provider billing/tokenization evidence.
+Unverified cache TTL opt-in is not enabled; optional `/v1/messages/count_tokens`
+is a **LOCAL estimate**, not provider billing/tokenization evidence. Pinned
+offline regressions cover both gateway header forms: count_tokens returns 200
+without a provider call; Responses/embeddings return 400, the alternate Anthropic
+route returns 401, and `/model/new` and `/key/generate` return 500 without a
+provider call. **Those 500s are not authorization proof**. The inference hook does
+not generically authorize/block administrative routes; do not treat it as an
+admin security boundary. Session-ID and arbitrary client headers are not forwarded;
+required native beta/classification behavior is preserved.
 
 Both `disable_background_health_check` per model and
 `health_check_skip_disabled_background_models` globally are required at startup.
@@ -134,6 +146,10 @@ subprocess scrubbing, and restores the previous environment in `finally`. This i
 defense in depth, not same-user process isolation or guaranteed zeroization of
 managed strings. Keep the gateway key out of arguments, settings, scripts, Git
 helpers, transcripts, and handoff files. Never put the server OAuth grant on Windows.
+It refuses inherited proxy/header/runtime/TLS conflicts before prompting or
+environment modification. `NO_PROXY` grants no exemption. Proxy-required sessions
+are deliberately incompatible: use only an organization-approved direct-access
+environment, never disable required organization controls to make it launch.
 
 ## Maintenance and costs
 

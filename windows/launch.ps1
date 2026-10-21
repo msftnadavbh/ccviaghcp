@@ -1,4 +1,17 @@
 $ErrorActionPreference = 'Stop'
+$conflicts = @('NODE_OPTIONS', 'ANTHROPIC_CUSTOM_HEADERS', 'SSLKEYLOGFILE', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY')
+$blocked = @()
+foreach ($item in Get-ChildItem Env:) {
+    $name = $item.Name.ToUpperInvariant()
+    if (($name -in $conflicts -and $item.Value.Length -gt 0) -or
+        ($name -eq 'NODE_TLS_REJECT_UNAUTHORIZED' -and $item.Value.Length -gt 0 -and $item.Value -cne '1')) {
+        $blocked += $name
+    }
+}
+if ($blocked.Count) {
+    throw ('Conflicting environment: ' + (($blocked | Sort-Object -Unique) -join ', ') +
+        '. Use an organization-approved environment for direct private-gateway access; do not disable required organization policy.')
+}
 $providerFlags = @('CLAUDE_CODE_USE_ANTHROPIC_AWS', 'CLAUDE_CODE_USE_BEDROCK',
     'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_MANTLE', 'CLAUDE_CODE_USE_VERTEX')
 $names = @('ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL',

@@ -7,7 +7,7 @@ import time
 import urllib.error
 import urllib.request
 
-from common import LOCAL, protect_dir, read_private, safe_endpoint, token, write_private
+from common import LOCAL, SafeError, protect_dir, read_private, safe_endpoint, token, write_private
 
 CLIENT_ID = 'Iv1.b507a08c87ecfe98'  # Same public client as the pinned Authenticator.
 HEADERS = {'Accept': 'application/json', 'Content-Type': 'application/json',
@@ -16,7 +16,7 @@ HEADERS = {'Accept': 'application/json', 'Content-Type': 'application/json',
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise ValueError('Redirect refused')
+        raise SafeError('Redirect refused')
 
 
 def request(url, data=None, headers=None):
@@ -27,21 +27,21 @@ def request(url, data=None, headers=None):
             return json.load(response)
     except Exception:
         # Response bodies and exception strings may contain credentials. Never echo them.
-        raise ValueError('GitHub request failed; details suppressed') from None
+        raise SafeError('GitHub request failed; details suppressed') from None
 
 
 def start():
     if (LOCAL / 'access-token').exists() or (LOCAL / 'device-state.json').exists():
-        raise ValueError('Existing authorization files; refusing to overwrite')
+        raise SafeError('Existing authorization files; refusing to overwrite')
     result = request('https://github.com/login/device/code', {'client_id': CLIENT_ID, 'scope': 'read:user'})
     import re
     if (result.get('verification_uri') != 'https://github.com/login/device'
             or not re.fullmatch(r'[A-Z0-9-]{4,20}', result.get('user_code', ''))
             or not isinstance(result.get('device_code'), str) or not result['device_code']):
-        raise ValueError('Invalid device response')
+        raise SafeError('Invalid device response')
     interval, expiry = result.get('interval', 5), result.get('expires_in', 0)
     if type(interval) is not int or not 1 <= interval <= 60 or type(expiry) is not int or not 1 <= expiry <= 1800:
-        raise ValueError('Invalid authorization timing')
+        raise SafeError('Invalid authorization timing')
     write_private(LOCAL / 'device-state.json', json.dumps({'device_code': result['device_code'],
                   'interval': interval, 'deadline': time.time() + expiry}))
     print('Visit https://github.com/login/device and enter code ' + result['user_code'])
@@ -61,14 +61,14 @@ def poll(state, call=request, now=time.time, sleep=time.sleep):
         if error == 'slow_down':
             interval += 5
         elif error != 'authorization_pending':
-            raise ValueError('Authorization denied, expired or failed; details suppressed')
-    raise ValueError('Device authorization expired')
+            raise SafeError('Authorization denied, expired or failed; details suppressed')
+    raise SafeError('Device authorization expired')
 
 
 def finish():
     state = json.loads(read_private(LOCAL / 'device-state.json'))
     if (LOCAL / 'access-token').exists():
-        raise ValueError('Refusing to overwrite existing access token')
+        raise SafeError('Refusing to overwrite existing access token')
     write_private(LOCAL / 'access-token', poll(state))
     (LOCAL / 'device-state.json').unlink()
     print('Authorized credential saved to protected designated file; no token displayed.')
@@ -79,11 +79,11 @@ def discover():
     entitlement = request('https://api.github.com/copilot_internal/user', headers={
         'Authorization': 'Bearer ' + access, 'X-GitHub-Api-Version': '2025-04-01'})
     if entitlement.get('chat_enabled') is not True:
-        raise ValueError('Copilot chat entitlement not enabled')
+        raise SafeError('Copilot chat entitlement not enabled')
     endpoint = safe_endpoint(entitlement.get('endpoints', {}).get('api'))
     catalog = request(endpoint + '/models', headers={'Authorization': 'Bearer ' + access})
     if not isinstance(catalog.get('data'), list):
-        raise ValueError('Invalid model catalog; stop for review')
+        raise SafeError('Invalid model catalog; stop for review')
     write_private(LOCAL / 'catalog.json', json.dumps({'verified_at': datetime.now(timezone.utc).isoformat(),
                   'endpoint': endpoint, 'response': catalog}, indent=2))
     print('Live catalog saved to .local/catalog.json; select entitled native Messages Claude IDs.')
@@ -96,6 +96,6 @@ if __name__ == '__main__':
     try:
         protect_dir(LOCAL)
         {'start': start, 'finish': finish, 'discover': discover}[args.action]()
-    except Exception:
-        print('Copilot operation failed; authorization/input/network details suppressed. Check designated files and consent/expiry.', file=sys.stderr)
+    except (Exception, KeyboardInterrupt) as error:
+        print('Copilot operation failed: ' + (str(error) if isinstance(error, SafeError) else type(error).__name__), file=sys.stderr)
         sys.exit(1)

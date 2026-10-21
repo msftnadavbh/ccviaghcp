@@ -5,6 +5,8 @@
 Bring your own authorized account, Azure target, and newly generated private
 artifacts. The gateway keeps native Messages, streaming, and tool calls; the
 client receives a gateway key, never the server's Copilot OAuth credential.
+That gateway key is a LiteLLM **master/admin credential for one trusted user**,
+not a least-privilege inference key.
 
 **This public export has not been cloud-deployed or accepted on Windows.**
 Private-lab results do not transfer to a new deployment. This is an independent

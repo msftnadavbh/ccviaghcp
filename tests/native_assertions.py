@@ -60,11 +60,30 @@ for auth in (None, 'x-api-key'):
     assert status in (401, 403) or (auth and status == 400 and json.loads(error)['error']['message'] == 'No connected db.'), status
     assert len(wires()) == before
 for auth in ('x-api-key', 'authorization'):
-    status, content = call(payload, {'anthropic-beta': 'synthetic-beta-2099-01-01'}, auth=auth)
+    status, content = call(payload, {'anthropic-beta': 'synthetic-beta-2099-01-01',
+        'x-claude-code-session-id': 'synthetic-session', 'x-arbitrary-client-header': 'synthetic-header'}, auth=auth)
     assert status == 200, (status, content)
     assert json.loads(content)['type'] == 'message'
     assert wires()[-1]['headers']['anthropic-beta'] == 'synthetic-beta-2099-01-01'
     assert wires()[-1]['headers']['x-initiator'] == 'user'
+    assert 'x-claude-code-session-id' not in wires()[-1]['headers']
+    assert 'x-arbitrary-client-header' not in wires()[-1]['headers']
+    for path, body, expected in (
+            ('/v1/messages/count_tokens', {'model': 'sonnet', 'messages': payload['messages']}, 200),
+            ('/v1/responses', {'model': 'sonnet', 'input': 'synthetic-audit-input'}, 400),
+            ('/anthropic/v1/messages', payload, 401),
+            ('/v1/embeddings', {'model': 'sonnet', 'input': 'synthetic-audit-input'}, 400),
+            ('/model/new', {'model_name': 'synthetic-audit-only', 'litellm_params': {
+                'model': 'openai/claude-sonnet-5.5', 'api_base': 'https://api.enterprise.githubcopilot.com',
+                'api_key': 'synthetic-invalid'}}, 500),
+            ('/key/generate', {'models': ['sonnet']}, 500)):
+        before = len(wires())
+        status, content = call(body, path=path, auth=auth)  # POST for each exact route/payload.
+        assert status == expected, (path, auth, status)
+        if path == '/v1/messages/count_tokens':
+            assert type(json.loads(content)['input_tokens']) is int
+        assert len(wires()) == before, (path, auth)
+# Admin 500s above are pinned no-database behavior, NOT authorization proof.
 assert Path('/tmp/production-redirects-checked').read_text() == 'false'
 status, content = call(payload | {'stream': True})
 assert status == 200 and b'"type": "message_stop"' in content, (status, content)

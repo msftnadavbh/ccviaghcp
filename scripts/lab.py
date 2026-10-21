@@ -11,7 +11,7 @@ import sys
 import time
 import uuid
 
-from common import (HOST, IMAGE, LOCAL, REGION, RG, ROOT, az, azure_target, model_config,
+from common import (HOST, IMAGE, LOCAL, REGION, RG, ROOT, SafeError, az, azure_target, model_config,
                     protect_dir, read_private, token, write_private)
 
 
@@ -25,57 +25,63 @@ def operator_object_id():
         _, tenant = azure_target()
         account = json.loads(az('account', 'show'))
         if account.get('user', {}).get('type') != 'user':
-            raise ValueError('User login required')
+            raise SafeError('User login required')
         result = json.loads(az('account', 'get-access-token', '--resource', 'https://management.azure.com/'))
         parts = result['accessToken'].split('.')
         if len(parts) != 3 or not all(parts):
-            raise ValueError('Malformed CLI token')
+            raise SafeError('Malformed CLI token')
         claims = json.loads(base64.urlsafe_b64decode(parts[1] + '=' * (-len(parts[1]) % 4)))
         if claims['tid'] != tenant:
-            raise ValueError('Token tenant mismatch')
+            raise SafeError('Token tenant mismatch')
         return str(uuid.UUID(claims['oid']))
     except Exception:
-        raise ValueError('Cannot discover operator user object ID from target-scoped Azure CLI claims') from None
+        raise SafeError('Cannot discover operator user object ID from target-scoped Azure CLI claims') from None
 
 
 def prepare(args):
     target = azure_target(required=not args.operator_object_id)
     binding = {} if target is None else {'expectedSubscriptionId': target[0], 'expectedTenantId': target[1]}
-    if not (LOCAL / 'deployment-inputs.json').exists():
-        operator = args.operator_object_id or operator_object_id()
-        operator = str(uuid.UUID(operator))
+    try:
         ip = ipaddress.ip_address(args.operator_ip)
-        if ip.version != 4 or not ip.is_global:
-            raise ValueError('Operator must supply current public IPv4 address')
+    except (ValueError, TypeError):
+        raise SafeError('Invalid operator-ip; supply a global IPv4 address') from None
+    if ip.version != 4 or not ip.is_global:
+        raise SafeError('Operator must supply current public IPv4 address')
+    try:
+        operator = str(uuid.UUID(args.operator_object_id)) if args.operator_object_id else None
+    except (ValueError, TypeError, AttributeError):
+        raise SafeError('Invalid operator-object-id UUID') from None
+    if not (LOCAL / 'deployment-inputs.json').exists():
+        operator = operator or operator_object_id()
         write_private(LOCAL / 'deployment-inputs.json', json.dumps(
             {'operatorObjectId': operator, 'operatorCidr': str(ip) + '/32'} | binding))
     else:
         inputs = json.loads(read_private(LOCAL / 'deployment-inputs.json'))
         if {key: inputs[key] for key in ('expectedSubscriptionId', 'expectedTenantId') if key in inputs} != binding:
-            raise ValueError('Azure target inputs changed or unbound; use a new deployment directory, not a retarget')
-        if (inputs['operatorCidr'] != str(ipaddress.ip_address(args.operator_ip)) + '/32'
-                or (args.operator_object_id and inputs['operatorObjectId'] != str(uuid.UUID(args.operator_object_id)))):
-            raise ValueError('Operator inputs changed; review existing protected inputs, do not silently overwrite')
+            raise SafeError('Azure target inputs changed or unbound; use a new deployment directory, not a retarget')
+        if (inputs['operatorCidr'] != str(ip) + '/32'
+                or (operator and inputs['operatorObjectId'] != operator)):
+            raise SafeError('Operator inputs changed; review existing protected inputs, do not silently overwrite')
     protect_dir(LOCAL)
     for name, value in [('admin-password', 'Aa1!' + secrets.token_urlsafe(30)),
                         ('gateway-key', 'sk-' + secrets.token_hex(32))]:
         path = LOCAL / name
         if path.exists():
             if not read_private(path).strip():
-                raise ValueError('Empty existing secret; refusing rotation')
+                raise SafeError('Empty existing secret; refusing rotation')
         else:
             write_private(path, value)
     certs = ['ca.key', 'ca.crt', 'tls.key', 'tls.crt']
     if any((LOCAL / f).exists() for f in certs):
         if not all((LOCAL / f).exists() for f in certs):
-            raise ValueError('Incomplete existing TLS material: stop, do not overwrite')
+            raise SafeError('Incomplete existing TLS material: stop, do not overwrite')
         for f in certs:
             read_private(LOCAL / f)
         constraints = subprocess.check_output(
             ['openssl', 'x509', '-in', str(LOCAL / 'ca.crt'), '-noout', '-ext', 'nameConstraints'],
             stderr=subprocess.DEVNULL, text=True)
         if 'critical' not in constraints or 'DNS:' + HOST not in constraints:
-            raise ValueError('Existing CA lacks the private DNS constraint; stop for reviewed reissue')
+            raise SafeError('Existing CA lacks the private DNS constraint; stop for reviewed reissue')
         openssl('verify', '-CAfile', LOCAL / 'ca.crt', '-verify_hostname', HOST, LOCAL / 'tls.crt')
     else:
         openssl('req', '-x509', '-newkey', 'rsa:3072', '-nodes', '-sha256', '-days', '365',
@@ -94,23 +100,29 @@ def deployment_inputs():
     subscription, tenant = azure_target()
     inputs = json.loads(read_private(LOCAL / 'deployment-inputs.json'))
     if inputs.get('expectedSubscriptionId') != subscription or inputs.get('expectedTenantId') != tenant:
-        raise ValueError('Azure target is unbound or changed; use a new deployment directory, not a retarget')
+        raise SafeError('Azure target is unbound or changed; use a new deployment directory, not a retarget')
     return inputs
 
 
 def parameters(phase):
     inputs = deployment_inputs()
     protect_dir(LOCAL)
-    uuid.UUID(inputs['operatorObjectId'])
-    network = ipaddress.ip_network(inputs['operatorCidr'])
+    try:
+        uuid.UUID(inputs['operatorObjectId'])
+    except (ValueError, TypeError, AttributeError):
+        raise SafeError('Invalid operatorObjectId UUID') from None
+    try:
+        network = ipaddress.ip_network(inputs['operatorCidr'])
+    except (ValueError, TypeError):
+        raise SafeError('Invalid operatorCidr public /32') from None
     if network.version != 4 or network.prefixlen != 32 or not network.network_address.is_global:
-        raise ValueError('Invalid operator public /32')
+        raise SafeError('Invalid operator public /32')
     values = inputs | {'adminPassword': read_private(LOCAL / 'admin-password'), 'phase': phase}
     path = LOCAL / ('parameters-' + phase + '.json')
     if path.exists():
         existing = json.loads(read_private(path))
         if existing['parameters'] != {k: {'value': v} for k, v in values.items()}:
-            raise ValueError('Existing parameters differ; review before explicitly removing this derived file')
+            raise SafeError('Existing parameters differ; review before explicitly removing this derived file')
     else:
         write_private(path, json.dumps({'$schema': 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#',
                        'contentVersion': '1.0.0.0', 'parameters': {k: {'value': v} for k, v in values.items()}}))
@@ -124,7 +136,7 @@ def deploy(args):
         for gate in gates:
             path = LOCAL / ('gate-' + gate + '.txt')
             if not path.exists() or not read_private(path).strip():
-                raise ValueError('STOP: missing evidence gate-' + gate + '.txt')
+                raise SafeError('STOP: missing evidence gate-' + gate + '.txt')
     params = parameters(args.phase)
     command = ['deployment', 'sub', args.action, '--location', REGION, '--name', 'ccviaghcp-' + args.phase,
                '--template-file', str(ROOT / 'infra/main.bicep'), '--parameters', '@' + str(params)]
@@ -140,12 +152,11 @@ def deploy(args):
             print(args.action + ' ' + args.phase + ' succeeded (ARM operation only).')
             return
         except subprocess.CalledProcessError as exc:
-            error = (exc.output or b'').decode(errors='replace')
+            error = (exc.output or b'') + b'\n' + (exc.stderr or b'')
             if (args.action != 'create' or args.phase != 'aks' or attempt == 2
-                    or not any(code in error for code in ('AuthorizationFailed', 'LinkedAuthorizationFailed', 'PrincipalNotFound'))):
+                    or not any(code in error for code in (b'AuthorizationFailed', b'LinkedAuthorizationFailed', b'PrincipalNotFound'))):
                 raise
             time.sleep(60 * (attempt + 1))
-    raise ValueError('Bounded identity propagation retry exhausted; no privilege changes made')
 
 
 def render():
@@ -156,7 +167,7 @@ def render():
     data = json.dumps(config, indent=2)
     if path.exists():
         if read_private(path) != data:
-            raise ValueError('Derived config changed; review and remove only config.json before rerender')
+            raise SafeError('Derived config changed; review and remove only config.json before rerender')
     else:
         write_private(path, data)
     print('Generated explicit live-catalog-backed .local/config.json; no wildcard model.')
@@ -185,7 +196,7 @@ def apply():
     target = next(c['cluster'] for c in actual['clusters'] if c['name'] == context['cluster'])
     if (target['server'] != 'https://' + expected + ':443' or target.get('insecure-skip-tls-verify')
             or not target.get('certificate-authority-data')):
-        raise ValueError('Kubernetes server mismatch')
+        raise SafeError('Kubernetes server mismatch')
     manifest = json.loads((ROOT / 'k8s/gateway.json').read_text())
     kubectl(kube, 'apply', '-f', '-', data=json.dumps(manifest['items'][0]))
     def secret(name, files, kind='Opaque'):
@@ -213,7 +224,7 @@ def local():
     render()
     token(read_private(LOCAL / 'access-token'))
     if os.getuid() != 1000 or os.getgid() != 1000:
-        raise ValueError('Local bind-mounted protected files require operator UID/GID 1000; stop for review')
+        raise SafeError('Local bind-mounted protected files require operator UID/GID 1000; stop for review')
     mounts = {LOCAL / 'config.json': '/etc/lab/config.json',
               ROOT / 'scripts/start_gateway.py': '/etc/lab/start_gateway.py',
               ROOT / 'scripts/gateway_policy.py': '/etc/lab/gateway_policy.py',
@@ -254,6 +265,6 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except Exception:
-        print('Lab operation failed; details suppressed to protect secrets. Inspect scope, inputs and Azure deployment status without exposing secure parameters.', file=sys.stderr)
+    except (Exception, KeyboardInterrupt) as error:
+        print('Lab operation failed: ' + (str(error) if isinstance(error, SafeError) else type(error).__name__), file=sys.stderr)
         sys.exit(1)

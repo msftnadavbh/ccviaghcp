@@ -18,9 +18,13 @@ WINDOW = 200000
 OUTPUT = 8192
 
 
+class SafeError(ValueError):
+    """Only deliberately authored, value-free messages may cross a CLI boundary."""
+
+
 def protect_dir(path=LOCAL):
     if path.is_symlink():
-        raise ValueError('Refusing symlink directory')
+        raise SafeError('Refusing symlink directory')
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path, 0o700)
 
@@ -35,12 +39,12 @@ def write_private(path, data):
 
 def read_private(path):
     if path.parent.is_symlink():
-        raise ValueError('Refusing symlink directory')
+        raise SafeError('Refusing symlink directory')
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd) as f:
         s = os.fstat(f.fileno())
         if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid():
-            raise ValueError('Expected owned regular file')
+            raise SafeError('Expected owned regular file')
         os.fchmod(f.fileno(), 0o600)
         return f.read()
 
@@ -48,13 +52,13 @@ def read_private(path):
 def token(value):
     value = value.strip()
     if not re.fullmatch(r'[A-Za-z0-9_]{20,512}', value):
-        raise ValueError('Invalid or empty access token')
+        raise SafeError('Invalid or empty access token')
     return value
 
 
 def safe_endpoint(value):
     if value != UPSTREAM:
-        raise ValueError('Unapproved Copilot endpoint')
+        raise SafeError('Unapproved Copilot endpoint')
     return value
 
 
@@ -70,14 +74,14 @@ def azure_target(required=True):
             if not value.int:
                 raise ValueError()
         except (KeyError, ValueError):
-            raise ValueError(name + ' must be set to a non-nil UUID') from None
+            raise SafeError(name + ' must be set to a non-nil UUID') from None
         values.append(str(value))
     return tuple(values)
 
 
 def check_account(account, subscription, tenant):
     if account.get('id') != subscription or account.get('tenantId') != tenant or account.get('state') != 'Enabled':
-        raise ValueError('Azure tenant/subscription/state mismatch')
+        raise SafeError('Azure tenant/subscription/state mismatch')
 
 
 def az(*args, input=None, timeout=None):
@@ -87,45 +91,54 @@ def az(*args, input=None, timeout=None):
     if args[:1] == ('rest',):
         env = os.environ | {'AZURE_LOGGING_ENABLE_LOG_FILE': 'false', 'AZURE_CORE_COLLECT_TELEMETRY': 'false'}
     # Check actual context before EVERY command, including after an operator login change.
-    account = subprocess.check_output(['az', 'account', 'show', '--subscription', subscription, '-o', 'json'],
-                                      stderr=subprocess.STDOUT, timeout=timeout, env=env)
+    account = subprocess.check_output(['az', 'account', 'show', '--subscription', subscription, '--only-show-errors', '-o', 'json'],
+                                      stderr=subprocess.PIPE, timeout=timeout, env=env)
     check_account(json.loads(account), subscription, tenant)
     return subprocess.check_output(['az', *args, '--subscription', subscription, '--only-show-errors', '-o', 'json'],
-                                   stderr=subprocess.STDOUT, input=input, timeout=timeout, env=env)
+                                   stderr=subprocess.PIPE, input=input, timeout=timeout, env=env)
 
 
 def model_config(catalog, selection):
     if not catalog.get('verified_at') or not safe_endpoint(catalog.get('endpoint', '')):
-        raise ValueError('Live discovery evidence is required')
+        raise SafeError('Live discovery evidence is required')
     if set(selection) != {'sonnet', 'opus', 'haiku'}:
-        raise ValueError('Select exactly sonnet, opus and haiku (reuse entitled IDs if needed)')
+        raise SafeError('Select exactly sonnet, opus and haiku (reuse entitled IDs if needed)')
     available = {m['id']: m for m in catalog['response']['data']}
     models = []
     for alias, model_id in selection.items():
         if not isinstance(model_id, str) or not re.fullmatch(r'claude-[A-Za-z0-9_.-]+', model_id):
-            raise ValueError('Only explicit discovered Claude IDs are allowed')
+            raise SafeError('Only explicit discovered Claude IDs are allowed')
+        if model_id not in available:
+            raise SafeError('Selected model is not in the live catalog')
         entry = available[model_id]
         if entry.get('policy', {}).get('state') != 'enabled':
-            raise ValueError('Selected model policy is not enabled')
+            raise SafeError('Selected model policy is not enabled')
         if '/v1/messages' not in entry.get('supported_endpoints', []):
-            raise ValueError('Model does not advertise native /v1/messages')
-        limits = entry['capabilities']['limits']
-        supports = entry['capabilities']['supports']
+            raise SafeError('Model does not advertise native /v1/messages')
+        capabilities = entry.get('capabilities')
+        if not isinstance(capabilities, dict):
+            raise SafeError('Missing live model capabilities')
+        limits = capabilities.get('limits')
+        if not isinstance(limits, dict):
+            raise SafeError('Live model limits must support fixed input 200000 and output 8192 caps')
+        supports = capabilities.get('supports', {})
         if any(supports.get(key) is not True for key in ('streaming', 'tool_calls', 'adaptive_thinking')):
-            raise ValueError('Native streaming/tool/adaptive capability evidence required')
-        inputs, outputs = limits['max_prompt_tokens'], limits['max_output_tokens']
-        if type(inputs) is not int or type(outputs) is not int or min(inputs, outputs) <= 0:
-            raise ValueError('Missing positive live model limits')
+            raise SafeError('Native streaming/tool/adaptive capability evidence required')
+        inputs, outputs = limits.get('max_prompt_tokens'), limits.get('max_output_tokens')
+        if type(inputs) is not int or inputs < WINDOW:
+            raise SafeError('Live model max_prompt_tokens must be an integer at least 200000')
+        if type(outputs) is not int or outputs < OUTPUT:
+            raise SafeError('Live model max_output_tokens must be an integer at least 8192')
         models.append({'model_name': alias,
                        'litellm_params': {'model': 'openai/' + model_id, 'api_base': UPSTREAM,
                                           'api_key': 'os.environ/COPILOT_OAUTH_TOKEN',
-                                          'max_tokens': min(OUTPUT, outputs)},
+                                          'max_tokens': OUTPUT},
                        'model_info': {'mode': 'anthropic_messages', 'supported_endpoints': ['/v1/messages'],
                                       'disable_background_health_check': True,
                                       'supports_adaptive_thinking': True, 'supports_reasoning': True,
                                       'supports_function_calling': True,
-                                      'max_tokens': min(WINDOW, inputs), 'max_input_tokens': min(WINDOW, inputs),
-                                      'max_output_tokens': min(OUTPUT, outputs)}})
+                                      'max_tokens': WINDOW, 'max_input_tokens': WINDOW,
+                                      'max_output_tokens': OUTPUT}})
     return {'model_list': models,
             'general_settings': {'master_key': 'os.environ/LITELLM_MASTER_KEY', 'disable_spend_logs': True,
                                  'health_check_skip_disabled_background_models': True,

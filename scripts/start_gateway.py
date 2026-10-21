@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-from common import OUTPUT, safe_endpoint, token
+from common import OUTPUT, SafeError, safe_endpoint, token
 
 
 def main():
@@ -19,7 +19,7 @@ def main():
             or settings.get('health_check_skip_disabled_background_models') is not True
             or 'gateway_policy.policy' not in config['litellm_settings'].get('callbacks', [])
             or {m['model_name'] for m in config['model_list']} != {'sonnet', 'opus', 'haiku'}):
-        raise ValueError('Missing native Messages security boundary')
+        raise SafeError('Missing native Messages security boundary')
     for model in config['model_list']:
         params = model['litellm_params']
         safe_endpoint(params['api_base'])
@@ -29,7 +29,7 @@ def main():
                 or not 1 <= params['max_tokens'] <= OUTPUT
                 or model['model_info'].get('disable_background_health_check') is not True
                 or model['model_info']['supported_endpoints'] != ['/v1/messages']):
-            raise ValueError('Unapproved native Messages deployment')
+            raise SafeError('Unapproved native Messages deployment')
     os.environ['HOME'] = '/tmp'
     os.environ['LITELLM_LOCAL_MODEL_COST_MAP'] = 'True'
     os.environ['LITELLM_LOG'] = 'CRITICAL'
@@ -44,6 +44,6 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except Exception:
-        print('Gateway startup refused: check designated OAuth file and pinned native Messages configuration.', file=sys.stderr)
+    except (Exception, KeyboardInterrupt) as error:
+        print('Gateway startup refused: ' + (str(error) if isinstance(error, SafeError) else type(error).__name__), file=sys.stderr)
         sys.exit(1)

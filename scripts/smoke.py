@@ -7,7 +7,7 @@ import socket
 import ssl
 import sys
 
-from common import HOST, LOCAL, read_private
+from common import HOST, LOCAL, SafeError, read_private
 
 
 class LabHTTPS(http.client.HTTPSConnection):
@@ -50,7 +50,8 @@ def run(host, port, count_tokens=False):
                     error = None
                 return response.status, error
             if payload.get('stream'):
-                assert response.getheader('content-type', '').startswith('text/event-stream')
+                if not response.getheader('content-type', '').startswith('text/event-stream'):
+                    raise SafeError('Native SSE content type mismatch')
                 return response.status, sse(response)
             return response.status, json.load(response)
         finally:
@@ -60,37 +61,44 @@ def run(host, port, count_tokens=False):
     for auth in (None, 'sk-deliberately-wrong-key'):
         status, error = call(payload, auth)
         # Pinned no-database proxy returns 400 (No connected db) for unknown keys.
-        assert status in (401, 403) or (auth is not None and status == 400
-            and isinstance(error, dict) and error.get('error', {}).get('message') == 'No connected db.'), 'Authentication rejection mismatch'
+        if not (status in (401, 403) or (auth is not None and status == 400
+                and isinstance(error, dict) and error.get('error', {}).get('message') == 'No connected db.')):
+            raise SafeError('Authentication rejection mismatch')
     print('PASS missing/wrong gateway authentication')
     status, plain = call(payload)
-    assert status == 200 and plain['type'] == 'message' and plain['role'] == 'assistant'
-    assert any(block['type'] == 'text' for block in plain['content'])
+    if not (status == 200 and plain['type'] == 'message' and plain['role'] == 'assistant'
+            and any(block['type'] == 'text' for block in plain['content'])):
+        raise SafeError('Native Messages JSON check failed')
     print('PASS native Messages JSON')
     status, events = call(payload | {'stream': True})
-    assert status == 200 and events[0]['type'] == 'message_start'
-    assert events[-1]['type'] == 'message_stop' and any(e['type'] == 'content_block_delta' for e in events)
-    assert not any(e['type'] == 'error' for e in events)
+    if not (status == 200 and events and events[0]['type'] == 'message_start'
+            and events[-1]['type'] == 'message_stop' and any(e['type'] == 'content_block_delta' for e in events)
+            and not any(e['type'] == 'error' for e in events)):
+        raise SafeError('Native Messages SSE check failed')
     print('PASS native Messages SSE')
     tool = {'name': 'get_probe_value', 'description': 'Get the opaque probe value. Do not guess it.',
             'input_schema': {'type': 'object', 'properties': {'id': {'type': 'string', 'enum': ['probe']}}, 'required': ['id']}}
     request = payload | {'max_tokens': 512, 'messages': [{'role': 'user', 'content':
         'Call get_probe_value with id probe. After receiving its result, reply with exactly that value.'}], 'tools': [tool]}
     status, result = call(request)
-    assert status == 200 and result['stop_reason'] == 'tool_use'
-    use = next(block for block in result['content'] if block['type'] == 'tool_use')
-    assert use['name'] == 'get_probe_value' and use['input']['id'] == 'probe'
+    if not (status == 200 and result['stop_reason'] == 'tool_use'):
+        raise SafeError('Native tool_use check failed')
+    use = next((block for block in result['content'] if block['type'] == 'tool_use'), None)
+    if not (use and use['name'] == 'get_probe_value' and use['input']['id'] == 'probe'):
+        raise SafeError('Native tool_use probe mismatch')
     nonce = secrets.token_hex(24)
     messages = request['messages'] + [{'role': 'assistant', 'content': result['content']},
         {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': use['id'], 'content': nonce}]}]
     status, final = call(payload | {'messages': messages, 'tools': [tool]})
-    assert status == 200 and final['stop_reason'] == 'end_turn'
-    assert nonce in ''.join(block.get('text', '') for block in final['content'] if block['type'] == 'text')
+    if not (status == 200 and final['stop_reason'] == 'end_turn'
+            and nonce in ''.join(block.get('text', '') for block in final['content'] if block['type'] == 'text')):
+        raise SafeError('Native tool_result round trip failed')
     print('PASS native tool_use/tool_result round trip')
     if count_tokens:
         status, result = call({'model': 'sonnet', 'messages': payload['messages']}, path='/v1/messages/count_tokens')
-        assert status == 200 and isinstance(result['input_tokens'], int)
-        print('PASS optional count_tokens (does not prove provider-side billing accuracy)')
+        if not (status == 200 and type(result['input_tokens']) is int):
+            raise SafeError('Optional local count_tokens estimate check failed')
+        print('PASS optional LOCAL count_tokens estimate (not provider-side billing accuracy)')
 
 
 if __name__ == '__main__':
@@ -100,6 +108,6 @@ if __name__ == '__main__':
     args = parser.parse_args()
     try:
         run(HOST if args.private else '127.0.0.1', 443 if args.private else 4000, args.count_tokens)
-    except Exception:
-        print('FAIL native smoke (details/bodies suppressed); check TLS/auth/model entitlement.', file=sys.stderr)
+    except (Exception, KeyboardInterrupt) as error:
+        print('FAIL native smoke: ' + (str(error) if isinstance(error, SafeError) else type(error).__name__), file=sys.stderr)
         sys.exit(1)

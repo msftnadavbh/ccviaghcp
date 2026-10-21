@@ -12,6 +12,8 @@ an approved Azure CLI **user** login, and appropriate deployment/role-assignment
 permissions. Docker runners require UID/GID 1000; they fail rather than loosen
 secret permissions for another user. No Python dependencies are installed on
 the operator host; gateway dependencies come from the pinned LiteLLM image.
+Offline certificate preparation/verification was tested with **OpenSSL 3.0.13
+(30 Jan 2024)**; this records the tested version, not a guessed minimum version.
 
 ```bash
 unset CCVIAGHCP_SUBSCRIPTION_ID CCVIAGHCP_TENANT_ID
@@ -154,7 +156,12 @@ In a trusted local editor, create `.local/selection.json`: a JSON object with
 exactly `sonnet`, `opus`, and `haiku` keys, each mapping to an actually discovered,
 enabled Claude model ID. Reusing one entitled ID is allowed. Do not copy the test
 fixtures as evidence. Each selected entry must advertise native `/v1/messages`,
-streaming, tool calls, adaptive thinking, and positive input/output limits.
+streaming, tool calls, adaptive thinking, and exact integer input/output limits of
+at least **200,000 / 8,192**. Every alias must fit the fixed Windows launcher caps;
+there is no automatic client adaptation to smaller catalog limits. Existing
+insufficient selections require operator review and a compatible live selection,
+not silently overwritten configuration. Rendering emits those fixed caps; the
+actual output policy remains 8,192. This is not server-side input token counting.
 
 ```bash
 chmod 600 .local/selection.json
@@ -167,7 +174,7 @@ terminal at the same repository root:
 
 ```bash
 python3 scripts/smoke.py
-# Optional token-count compatibility check, not billing accuracy:
+# Optional LOCAL token-count estimate, not provider billing accuracy:
 python3 scripts/smoke.py --count-tokens
 ```
 
@@ -224,6 +231,10 @@ The secure VM password remains in protected parameter files for both phases,
 though the AKS phase does not use it. Parameters travel by protected `@` file,
 never a literal secret argument. No complete-mode or cloud deletion is supplied.
 
+Timeout or Ctrl-C does **not** cancel an ARM deployment. Inspect its provisioning
+status in the intended Azure scope before retrying; never replay a create while
+the original operation is still pending.
+
 `infra/main.bicep` requires explicit expected subscription/tenant parameters.
 Its resource/module conditions prevent creation when actual ARM scope differs.
 **A false condition does not necessarily make ARM validation fail**; it can mean
@@ -248,3 +259,176 @@ your new public-CA handoff, strict native-client TLS/authentication/model/tool
 acceptance, and real classification/restart checks remain your responsibility.
 Windows acceptance is **after** backend deployment, not an additional create gate.
 See [security and maintenance](security.md) before operating or sharing artifacts.
+
+## Operator public-IP change (management API only)
+
+Use an **exclusive operator window**, with no other preparation/deployment/input
+edits running. Keep the existing target settings and existing ARM update
+authorization; this procedure grants no rights. Supply the new public IPv4
+yourself, not through an external IP-discovery service. Do not replay templates:
+the only cloud mutation is the fixed AKS authorized-range update below. No NSG,
+roles, Kubernetes version, foundation, or workloads are changed.
+
+The [AKS documentation](https://learn.microsoft.com/azure/aks/api-server-authorized-ip-ranges)
+(checked via Context7, then Microsoft Learn) states that updating **replaces** the
+list. Preserve the actual foundation NAT `/32`. Stop on drift or pending ARM state.
+Timeout/Ctrl-C is not ARM cancellation: inspect provisioning state before retry.
+Already-updated ARM is accepted for interrupted-run recovery; propagation can take
+two minutes. Run from this repository root:
+
+<!-- operator-ip-update: tested verbatim offline -->
+```bash
+read -r -p 'New operator public IPv4: ' NEW_OPERATOR_IPV4
+NEW_OPERATOR_IPV4="$NEW_OPERATOR_IPV4" python3 - <<'PY'
+import ipaddress
+import json
+import os
+import sys
+import tempfile
+sys.path.insert(0, 'scripts')
+import common
+import lab
+
+updated = False
+attempted = False
+try:
+    inputs = lab.deployment_inputs()  # Binding guard BEFORE any Azure call.
+    original = common.read_private(lab.LOCAL / 'deployment-inputs.json')
+    if json.loads(original) != inputs:
+        raise common.SafeError('Deployment inputs changed; stop')
+
+    def public_cidr(value):
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            raise common.SafeError('Invalid operator or NAT IPv4 address') from None
+        if address.version != 4 or not address.is_global:
+            raise common.SafeError('Operator and NAT addresses must be global IPv4')
+        return str(address) + '/32'
+
+    new = public_cidr(os.environ['NEW_OPERATOR_IPV4'])
+    old = inputs['operatorCidr']
+    if not old.endswith('/32') or public_cidr(old[:-3]) != old:
+        raise common.SafeError('Invalid existing operatorCidr')
+    password = common.read_private(lab.LOCAL / 'admin-password')
+    derived = {}
+    for phase in ('foundation', 'aks'):
+        path = lab.LOCAL / ('parameters-' + phase + '.json')
+        data = common.read_private(path) if path.exists() else None
+        derived[phase] = data
+        if data is not None:
+            values = json.loads(data)['parameters']
+            cidr = values['operatorCidr']['value']
+            if not cidr.endswith('/32') or public_cidr(cidr[:-3]) != cidr:
+                raise common.SafeError('Invalid derived operatorCidr')
+            expected = {k: {'value': v} for k, v in (inputs | {'adminPassword': password, 'phase': phase}).items()}
+            # Only operatorCidr may be stale after interrupted local reconciliation.
+            if values | {'operatorCidr': expected['operatorCidr']} != expected:
+                raise common.SafeError('Derived parameters differ from bound inputs/password; stop')
+
+    subscription, tenant = common.azure_target()
+    base = '/subscriptions/' + subscription + '/resourceGroups/' + common.RG + '/providers/'
+    cluster_id = base + 'Microsoft.ContainerService/managedClusters/ccviaghcp-aks'
+    nat_id = base + 'Microsoft.Network/natGateways/ccviaghcp-nat'
+    pip_id = base + 'Microsoft.Network/publicIPAddresses/ccviaghcp-nat-pip'
+    subnet_id = base + 'Microsoft.Network/virtualNetworks/ccviaghcp-vnet/subnets/aks'
+    identity_id = base + 'Microsoft.ManagedIdentity/userAssignedIdentities/ccviaghcp-aks-control'
+
+    def read(*args):
+        return json.loads(common.az(*args, timeout=900))
+
+    def resource(value, identifier):
+        if value['id'].lower() != identifier.lower() or value['provisioningState'] != 'Succeeded':
+            raise common.SafeError('ARM resource mismatch or operation pending; stop')
+
+    def cluster():
+        value = read('aks', 'show', '--resource-group', common.RG, '--name', 'ccviaghcp-aks')
+        resource(value, cluster_id)
+        aad, network = value['aadProfile'], value['networkProfile']
+        if (value['location'] != common.REGION or value['enableRbac'] is not True
+                or value['disableLocalAccounts'] is not True
+                or aad['tenantId'] != tenant or aad['managed'] is not True or aad['enableAzureRbac'] is not True
+                or value['apiServerAccessProfile'].get('enablePrivateCluster') not in (None, False)
+                or value['identity']['type'] != 'UserAssigned'
+                or {k.lower() for k in value['identity']['userAssignedIdentities']} != {identity_id.lower()}
+                or value['nodeResourceGroup'] != 'ccviaghcp-aks-nodes-rg'
+                or not value['agentPoolProfiles']
+                or any(p['vnetSubnetId'].lower() != subnet_id.lower() for p in value['agentPoolProfiles'])
+                or any(str(network.get(k, '')).lower() != v.lower() for k, v in {
+                    'outboundType': 'userAssignedNATGateway', 'networkPlugin': 'azure',
+                    'networkPluginMode': 'overlay', 'networkDataplane': 'cilium', 'networkPolicy': 'cilium',
+                    'loadBalancerSku': 'standard', 'podCidr': '10.78.0.0/16',
+                    'serviceCidr': '10.79.0.0/16', 'dnsServiceIp': '10.79.0.10'}.items())):
+            raise common.SafeError('AKS tenant/security/topology drift; stop')
+        return sorted(value['apiServerAccessProfile']['authorizedIpRanges'])
+
+    ranges = cluster()
+    nat = read('network', 'nat', 'gateway', 'show', '--resource-group', common.RG, '--name', 'ccviaghcp-nat')
+    pip = read('network', 'public-ip', 'show', '--resource-group', common.RG, '--name', 'ccviaghcp-nat-pip')
+    subnet = read('network', 'vnet', 'subnet', 'show', '--resource-group', common.RG,
+                  '--vnet-name', 'ccviaghcp-vnet', '--name', 'aks')
+    for value, identifier in ((nat, nat_id), (pip, pip_id), (subnet, subnet_id)):
+        resource(value, identifier)
+    if (nat['location'] != common.REGION or nat['sku']['name'] != 'Standard'
+            or [p['id'].lower() for p in nat['publicIpAddresses']] != [pip_id.lower()]
+            or nat.get('publicIpPrefixes') or pip['location'] != common.REGION
+            or pip['sku']['name'] != 'Standard' or pip['publicIPAllocationMethod'] != 'Static'
+            or pip['publicIPAddressVersion'] != 'IPv4' or subnet['addressPrefix'] != '10.77.0.0/24'
+            or subnet['natGateway']['id'].lower() != nat_id.lower()):
+        raise common.SafeError('Foundation NAT topology drift; stop')
+    nat_cidr = public_cidr(pip['ipAddress'])
+    if new == nat_cidr:
+        raise common.SafeError('New operator IPv4 must differ from the NAT address')
+    desired = sorted([new, nat_cidr])
+    if ranges not in (sorted([old, nat_cidr]), desired):
+        raise common.SafeError('Unexpected authorized IP ranges; stop')
+    if ranges != desired:
+        attempted = True
+        read('aks', 'update', '--resource-group', common.RG, '--name', 'ccviaghcp-aks',
+             '--api-server-authorized-ip-ranges', ','.join(desired))
+    if cluster() != desired:
+        raise common.SafeError('ARM readback ranges mismatch; inspect state before retry')
+    updated = True
+
+    if (common.read_private(lab.LOCAL / 'deployment-inputs.json') != original
+            or lab.deployment_inputs() != inputs
+            or common.read_private(lab.LOCAL / 'admin-password') != password):
+        raise common.SafeError('Local inputs changed; stop')
+    for phase, data in derived.items():
+        path = lab.LOCAL / ('parameters-' + phase + '.json')
+        if (common.read_private(path) if path.exists() else None) != data:
+            raise common.SafeError('Derived parameters changed; stop')
+    fd, temporary = tempfile.mkstemp(prefix='.deployment-inputs-', dir=lab.LOCAL)
+    try:
+        with os.fdopen(fd, 'w') as file:
+            file.write(json.dumps(inputs | {'operatorCidr': new}))
+        if common.read_private(lab.LOCAL / 'deployment-inputs.json') != original:
+            raise common.SafeError('Deployment inputs changed; stop')
+        os.replace(temporary, lab.LOCAL / 'deployment-inputs.json')
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    for phase in ('foundation', 'aks'):
+        (lab.LOCAL / ('parameters-' + phase + '.json')).unlink(missing_ok=True)
+    for phase in ('foundation', 'aks'):
+        lab.parameters(phase)
+    print('PASS ARM ranges and local operatorCidr reconciled; NAT preserved')
+except BaseException as error:
+    if updated:
+        print('ARM updated; local reconciliation incomplete', file=sys.stderr)
+    elif attempted:
+        print('ARM update outcome unconfirmed; inspect provisioning state before retry', file=sys.stderr)
+    print(str(error) if isinstance(error, common.SafeError) else type(error).__name__, file=sys.stderr)
+    sys.exit(1)
+PY
+```
+
+Individual file replacement is atomic, **not** a distributed transaction. If ARM
+is updated but local reconciliation fails, there is no overall PASS: inspect
+state, then repeat in the same exclusive window. The block tolerates stale derived
+`operatorCidr` only, validating every other parameter and the unchanged password
+before mutation. Only deployment inputs and the two derived parameter files may
+change; principal/bindings, secrets, TLS, and other private files are preserved.
+The new operator address must differ from the NAT address. A host already using
+that NAT is already covered by its allowance; this two-address procedure stops
+rather than removing the separate operator entry.
